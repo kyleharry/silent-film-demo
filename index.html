@@ -2,22 +2,23 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<title>Orthochromatic Camera — Fast + Flip</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no" />
+<title>Orthochromatic Camera — iOS-safe</title>
 <style>
-  html,body {margin:0;height:100%;background:#000}
-  #ui{position:fixed;left:8px;top:8px;display:flex;gap:8px;z-index:10}
+  html,body{margin:0;height:100%;background:#000}
+  #ui{position:fixed;left:8px;top:8px;display:flex;gap:8px;z-index:1000}
   button,select{font:14px system-ui,sans-serif;padding:.6em .8em;border:0;border-radius:10px}
   #start{background:#fff}
   #flip,#stutter{background:#222;color:#ddd}
   #fpscap{background:#222;color:#ddd}
+  #err{position:fixed;left:8px;bottom:8px;max-width:90vw;color:#f55;font:12px ui-monospace,monospace;white-space:pre-wrap;background:rgba(0,0,0,.6);padding:6px 8px;border-radius:8px;z-index:1001}
   canvas{width:100vw;height:100vh;display:block}
   .frame{position:fixed;inset:0;pointer-events:none;box-shadow:inset 0 0 120px 40px rgba(0,0,0,.9);border:14px solid #000}
 </style>
 </head>
 <body>
 <video id="vid" playsinline muted style="display:none"></video>
-<canvas id="glc"></canvas>
+<canvas id="stage"></canvas>
 <div class="frame"></div>
 
 <div id="ui">
@@ -31,252 +32,255 @@
     <option value="16">16</option>
   </select>
 </div>
+<div id="err"></div>
 
 <script>
-(async function(){
-  const video = document.getElementById('vid');
-  const canvas = document.getElementById('glc');
-  const startBtn = document.getElementById('start');
-  const flipBtn = document.getElementById('flip');
-  const stutterBtn = document.getElementById('stutter');
-  const fpsCapSel = document.getElementById('fpscap');
+(function(){
+  // --- UI + state -----------------------------------------------------------
+  const $ = id => document.getElementById(id);
+  const video = $('vid');
+  const canvas = $('stage');
+  const startBtn = $('start');
+  const flipBtn = $('flip');
+  const stutterBtn = $('stutter');
+  const fpsCapSel = $('fpscap');
+  const errBox = $('err');
 
-  let gl, program, tex, posBuf, uvBuf, u_time, u_resolution, u_yellow, u_grain, u_vignette, u_tex, u_gate, u_orthoMix, u_stutterSteps;
-  let stream, facing = 'environment', running = false;
-  let lastDraw = 0;
+  let facing = 'environment';
+  let stream = null;
+  let running = false;
 
-  // WebGL setup
-  function initGL(){
-    gl = canvas.getContext('webgl', {antialias:false, preserveDrawingBuffer:false});
-    if(!gl){ alert('WebGL not available'); return false; }
+  // Rendering backends
+  let useWebGL = false, gl = null, program = null, tex = null;
+  let u = {};        // uniforms
+  let ctx2d = null;  // fallback
 
-    const vs = `
-      attribute vec2 a_pos;
-      attribute vec2 a_uv;
-      varying vec2 v_uv;
-      void main(){
-        v_uv = a_uv;
-        gl_Position = vec4(a_pos, 0.0, 1.0);
-      }`;
-    const fs = `
-      precision mediump float;
-      varying vec2 v_uv;
-      uniform sampler2D u_tex;
-      uniform vec2  u_resolution;
-      uniform float u_time;
-      uniform float u_yellow;   // 0..0.3 (blue reduction)
-      uniform float u_grain;    // 0..0.2
-      uniform float u_vignette; // 0..1
-      uniform float u_gate;     // jitter amplitude in pixels
-      uniform vec3  u_orthoMix; // r,g,b weights sum to 1
-      uniform float u_stutterSteps; // 0 = off, otherwise steps per second
-
-      // sRGB <-> linear helpers
-      float srgb2lin(float u){ return (u<=0.04045)? u/12.92 : pow((u+0.055)/1.055,2.4); }
-      float lin2srgb(float u){ return (u<=0.0031308)? 12.92*u : 1.055*pow(u,1.0/2.4)-0.055; }
-      vec3  srgb2lin(vec3 c){ return vec3(srgb2lin(c.r), srgb2lin(c.g), srgb2lin(c.b)); }
-      vec3  lin2srgb(vec3 c){ return vec3(lin2srgb(c.r), lin2srgb(c.g), lin2srgb(c.b)); }
-
-      // Filmic-ish S-curve
-      float filmic(float x){
-        x = clamp(x,0.0,1.0);
-        float a=0.22, b=0.3, c=0.1, d=0.2, e=0.01, f=0.3;
-        return ((x*(a*x+c*b)+d*e)/(x*(a*x+b)+d*f))-e/f;
-      }
-
-      // Hash noise
-      float hash(vec2 p){
-        p = vec2(dot(p, vec2(127.1,311.7)), dot(p, vec2(269.5,183.3)));
-        return -1.0 + 2.0*fract(sin(p)*43758.5453123);
-      }
-
-      void main(){
-        // Optional cadence stutter by quantizing time used for grain/jitter only
-        float t = u_time;
-        if (u_stutterSteps > 0.0) {
-          float step = 1.0 / u_stutterSteps;
-          t = floor(u_time/step)*step;
-        }
-
-        // Gate weave (tiny jitter in texture coords)
-        vec2 px = 1.0 / u_resolution;
-        float jx = hash(vec2(t*13.1, 7.7))*u_gate*px.x;
-        float jy = hash(vec2(t*9.3,  5.2))*u_gate*px.y;
-        vec2 uv = v_uv + vec2(jx, jy);
-
-        // Sample source (already sRGB in video texture)
-        vec3 s = texture2D(u_tex, uv).rgb;
-
-        // Convert to linear
-        s = srgb2lin(s);
-
-        // Yellow “filter”: reduce blue slightly to tame sky
-        s.b *= (1.0 - u_yellow);
-
-        // Orthochromatic mix
-        float y = dot(s, u_orthoMix);
-
-        // Extra red crush based on redness proxy
-        float redness = max(0.0, s.r - max(s.g, s.b));
-        y = max(0.0, y - redness * 0.08);
-
-        // Filmic curve
-        y = filmic(y);
-
-        // Grain (time+uv hash)
-        float g = hash(uv*vec2(1024.0,768.0) + t*37.0) * u_grain;
-        y = clamp(y + g, 0.0, 1.0);
-
-        // Back to sRGB
-        float ys = lin2srgb(y);
-
-        // Vignette
-        vec2 p = (gl_FragCoord.xy / u_resolution);
-        float r = distance(p, vec2(0.5));
-        float vig = smoothstep(0.9, 0.5, 1.0 - r); // center bright, edges dark
-        float vMix = mix(1.0, vig, u_vignette);
-
-        gl_FragColor = vec4(vec3(ys) * vMix, 1.0);
-      }`;
-
-    function compile(type, src){
-      const s = gl.createShader(type);
-      gl.shaderSource(s, src); gl.compileShader(s);
-      if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){ throw new Error(gl.getShaderInfoLog(s)); }
-      return s;
-    }
-    program = gl.createProgram();
-    gl.attachShader(program, compile(gl.VERTEX_SHADER, vs));
-    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fs));
-    gl.linkProgram(program);
-    if(!gl.getProgramParameter(program, gl.LINK_STATUS)){ throw new Error(gl.getProgramInfoLog(program)); }
-    gl.useProgram(program);
-
-    // Fullscreen quad
-    posBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-      -1,-1,  1,-1, -1, 1,
-       1,-1,  1, 1, -1, 1
-    ]), gl.STATIC_DRAW);
-    const a_pos = gl.getAttribLocation(program, 'a_pos');
-    gl.enableVertexAttribArray(a_pos);
-    gl.vertexAttribPointer(a_pos, 2, gl.FLOAT, false, 0, 0);
-
-    uvBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-      0,0, 1,0, 0,1,
-      1,0, 1,1, 0,1
-    ]), gl.STATIC_DRAW);
-    const a_uv = gl.getAttribLocation(program, 'a_uv');
-    gl.enableVertexAttribArray(a_uv);
-    gl.vertexAttribPointer(a_uv, 2, gl.FLOAT, false, 0, 0);
-
-    // Video texture
-    tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
-    // Uniforms
-    u_time = gl.getUniformLocation(program, 'u_time');
-    u_resolution = gl.getUniformLocation(program, 'u_resolution');
-    u_yellow = gl.getUniformLocation(program, 'u_yellow');
-    u_grain = gl.getUniformLocation(program, 'u_grain');
-    u_vignette = gl.getUniformLocation(program, 'u_vignette');
-    u_gate = gl.getUniformLocation(program, 'u_gate');
-    u_orthoMix = gl.getUniformLocation(program, 'u_orthoMix');
-    u_stutterSteps = gl.getUniformLocation(program, 'u_stutterSteps');
-    u_tex = gl.getUniformLocation(program, 'u_tex');
-    gl.uniform1i(u_tex, 0);
-
-    gl.uniform1f(u_yellow, 0.10);
-    gl.uniform1f(u_grain, 0.08);
-    gl.uniform1f(u_vignette, 0.55);
-    gl.uniform1f(u_gate, 2.0);
-    gl.uniform3f(u_orthoMix, 0.06, 0.62, 0.32); // red, green, blue
-    gl.uniform1f(u_stutterSteps, 0.0);
-
-    resize();
-    return true;
+  // Error helper that shows on-screen (don’t rely on console on iOS Chrome)
+  function note(msg){
+    errBox.textContent = msg;
+  }
+  function clearNote(){
+    errBox.textContent = '';
   }
 
+  // --- Sizing ---------------------------------------------------------------
   function resize(){
     const dpr = Math.max(1, Math.min(3, window.devicePixelRatio||1));
     const w = Math.floor(innerWidth*dpr), h = Math.floor(innerHeight*dpr);
     canvas.width = w; canvas.height = h;
-    gl && gl.viewport(0,0,w,h);
-    gl && gl.uniform2f(u_resolution, w, h);
+    if (useWebGL && gl) { gl.viewport(0,0,w,h); gl.uniform2f(u.resolution, w, h); }
   }
-  addEventListener('resize', resize, {passive:true});
+  window.addEventListener('resize', resize, {passive:true});
 
+  // --- WebGL init with guarded errors --------------------------------------
+  function initWebGL(){
+    try{
+      gl = canvas.getContext('webgl', {antialias:false, preserveDrawingBuffer:false});
+      if(!gl) return false;
+
+      const vs = `
+        attribute vec2 a_pos, a_uv;
+        varying vec2 v_uv;
+        void main(){ v_uv = a_uv; gl_Position = vec4(a_pos,0.0,1.0); }`;
+      const fs = `
+        precision mediump float;
+        varying vec2 v_uv;
+        uniform sampler2D tex0;
+        uniform vec2  resolution;
+        uniform float time, yellow, grain, vignette, gate, stutterSteps;
+        uniform vec3  orthoMix;
+        float srgb2lin1(float u){ return (u<=0.04045)? u/12.92 : pow((u+0.055)/1.055,2.4); }
+        float lin2srgb1(float u){ return (u<=0.0031308)? 12.92*u : 1.055*pow(u,1.0/2.4)-0.055; }
+        vec3  srgb2lin(vec3 c){ return vec3(srgb2lin1(c.r), srgb2lin1(c.g), srgb2lin1(c.b)); }
+        float filmic(float x){
+          x = clamp(x,0.0,1.0);
+          float a=0.22,b=0.3,c=0.1,d=0.2,e=0.01,f=0.3;
+          return ((x*(a*x+c*b)+d*e)/(x*(a*x+b)+d*f))-e/f;
+        }
+        float hash(vec2 p){ p=vec2(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3))); return -1.0 + 2.0*fract(sin(p)*43758.5453); }
+        void main(){
+          float t = time;
+          if (stutterSteps > 0.0) {
+            float step = 1.0 / stutterSteps;
+            t = floor(time/step)*step;
+          }
+          vec2 px = 1.0 / resolution;
+          vec2 uv = v_uv + vec2(hash(vec2(t*13.1,7.7))*gate*px.x, hash(vec2(t*9.3,5.2))*gate*px.y);
+          vec3 s = texture2D(tex0, uv).rgb;
+          s = srgb2lin(s);
+          s.b *= (1.0 - yellow);
+          float y = dot(s, orthoMix);
+          float redness = max(0.0, s.r - max(s.g, s.b));
+          y = max(0.0, y - redness*0.08);
+          y = filmic(y);
+          y = clamp(y + hash(uv*vec2(1024.0,768.0)+t*37.0)*grain, 0.0, 1.0);
+          float ys = lin2srgb1(y);
+          vec2 p = gl_FragCoord.xy / resolution;
+          float r = distance(p, vec2(0.5));
+          float vig = smoothstep(0.9, 0.5, 1.0 - r);
+          float vMix = mix(1.0, vig, vignette);
+          gl_FragColor = vec4(vec3(ys)*vMix, 1.0);
+        }`;
+
+      function sh(type, src){
+        const s = gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+        if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+        return s;
+      }
+      program = gl.createProgram();
+      gl.attachShader(program, sh(gl.VERTEX_SHADER, vs));
+      gl.attachShader(program, sh(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(program);
+      if(!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+      gl.useProgram(program);
+
+      const quad = new Float32Array([-1,-1, 1,-1, -1,1, 1,-1, 1,1, -1,1]);
+      const uvs  = new Float32Array([ 0,0, 1,0, 0,1, 1,0, 1,1, 0,1]);
+
+      const b1 = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b1); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+      const a_pos = gl.getAttribLocation(program, 'a_pos');
+      gl.enableVertexAttribArray(a_pos); gl.vertexAttribPointer(a_pos, 2, gl.FLOAT, false, 0, 0);
+
+      const b2 = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, b2); gl.bufferData(gl.ARRAY_BUFFER, uvs, gl.STATIC_DRAW);
+      const a_uv = gl.getAttribLocation(program, 'a_uv');
+      gl.enableVertexAttribArray(a_uv); gl.vertexAttribPointer(a_uv, 2, gl.FLOAT, false, 0, 0);
+
+      tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+      function U(n){ return gl.getUniformLocation(program, n); }
+      u.time = U('time'); u.resolution = U('resolution'); u.yellow = U('yellow');
+      u.grain = U('grain'); u.vignette = U('vignette'); u.gate = U('gate');
+      u.orthoMix = U('orthoMix'); u.stutterSteps = U('stutterSteps');
+      gl.uniform1i(gl.getUniformLocation(program,'tex0'), 0);
+      gl.uniform1f(u.yellow, 0.10);
+      gl.uniform1f(u.grain, 0.08);
+      gl.uniform1f(u.vignette, 0.55);
+      gl.uniform1f(u.gate, 2.0);
+      gl.uniform3f(u.orthoMix, 0.06, 0.62, 0.32);
+      gl.uniform1f(u.stutterSteps, 0.0);
+
+      useWebGL = true;
+      resize();
+      return true;
+    }catch(e){
+      note('WebGL init failed: ' + e.message);
+      useWebGL = false;
+      return false;
+    }
+  }
+
+  // --- 2D fallback (keeps you unblocked even if WebGL is unavailable) ------
+  function init2D(){
+    ctx2d = canvas.getContext('2d', { willReadFrequently: true });
+    useWebGL = false;
+    resize();
+  }
+
+  // --- Camera ---------------------------------------------------------------
   async function startStream(){
-    if(stream){ stream.getTracks().forEach(t=>t.stop()); }
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: facing,
-        width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60, max: 60 }
-      },
-      audio: false
-    });
-    video.srcObject = stream;
-    await video.play();
+    try{
+      if(stream) stream.getTracks().forEach(t=>t.stop());
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: facing, width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:60,max:60} },
+        audio: false
+      });
+      video.srcObject = stream;
+      // iOS requires this after a user gesture; we are inside a click
+      await video.play();
+      clearNote();
+    }catch(e){
+      note('Camera error: ' + (e.message || e.name));
+      throw e;
+    }
   }
 
-  function draw(now){
+  // --- Draw loops -----------------------------------------------------------
+  let lastDraw = 0;
+  function drawGL(now){
     if(!running) return;
-    // FPS cap (draw throttling only; camera still 60fps)
     const cap = parseInt(fpsCapSel.value, 10);
     if(cap>0){
       const minDelta = 1000/cap;
-      if(now - lastDraw < minDelta){ requestAnimationFrame(draw); return; }
+      if(now - lastDraw < minDelta){ requestAnimationFrame(drawGL); return; }
       lastDraw = now;
     }
-
-    // Update texture from <video>
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video); }
-    catch(e) { /* iOS can throw once before ready; ignore */ }
-
-    gl.uniform1f(u_time, now/1000.0);
+    // iOS can throw before the first ready frame; guard it
+    try{ gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,video); }catch(_) {}
+    gl.uniform1f(u.time, now/1000);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-    requestAnimationFrame(draw);
+    requestAnimationFrame(drawGL);
   }
 
-  startBtn.onclick = async () => {
-    if(!gl && !initGL()) return;
-    startBtn.disabled = true;
-    await startStream();
-    running = true;
-    flipBtn.disabled = false;
-    stutterBtn.disabled = false;
-    fpsCapSel.disabled = false;
-    requestAnimationFrame(draw);
-  };
+  // very simple grayscale ortho in 2D (fallback path)
+  function draw2D(){
+    if(!running) return;
+    const w = canvas.width, h = canvas.height;
+    const vw = video.videoWidth||1280, vh = video.videoHeight||720;
+    const vR = vw/vh, cR = w/h;
+    let dw, dh, dx, dy;
+    if (vR > cR) { dh=h; dw=dh*vR; dx=(w-dw)/2; dy=0; } else { dw=w; dh=dw/vR; dx=0; dy=(h-dh)/2; }
+    ctx2d.drawImage(video, dx, dy, dw, dh);
+    const img = ctx2d.getImageData(0,0,w,h), d = img.data;
+    for(let i=0;i<d.length;i+=4){
+      // quick ortho weights in sRGB space (approx; acceptable for fallback)
+      const y = 0.06*d[i] + 0.62*d[i+1] + 0.32*d[i+2];
+      d[i]=d[i+1]=d[i+2]=y;
+    }
+    ctx2d.putImageData(img,0,0);
+    requestAnimationFrame(draw2D);
+  }
 
-  flipBtn.onclick = async () => {
-    facing = (facing === 'environment') ? 'user' : 'environment';
-    await startStream();
-  };
+  // --- Event bindings (bind FIRST; do not let earlier errors prevent this) --
+  startBtn.addEventListener('click', async () => {
+    try{
+      clearNote();
+      // Initialize backend lazily on first tap
+      if (!gl && !ctx2d) {
+        if (!initWebGL()) init2D();
+      }
+      await startStream();
+      running = true;
+      flipBtn.disabled = false;
+      stutterBtn.disabled = !useWebGL;
+      fpsCapSel.disabled = false;
+      if (useWebGL) requestAnimationFrame(drawGL); else requestAnimationFrame(draw2D);
+    }catch(e){
+      // keep Start enabled so the user can retry after granting permission
+    }
+  }, {passive:true});
 
-  stutterBtn.onclick = () => {
+  flipBtn.addEventListener('click', async () => {
+    try{
+      facing = (facing === 'environment') ? 'user' : 'environment';
+      await startStream();
+    }catch(e){}
+  }, {passive:true});
+
+  stutterBtn.addEventListener('click', () => {
+    if (!useWebGL) return;
     const on = stutterBtn.getAttribute('data-on') === '1';
     const next = on ? '0' : '1';
     stutterBtn.setAttribute('data-on', next);
     stutterBtn.textContent = `Stutter: ${next==='1'?'on':'off'}`;
-    // 16 steps/sec ≈ 16fps cadence for grain/jitter only (video stays full speed)
-    gl.uniform1f(u_stutterSteps, next==='1' ? 16.0 : 0.0);
-  };
+    gl.uniform1f(u.stutterSteps, next==='1' ? 16.0 : 0.0);
+  }, {passive:true});
 
-  fpsCapSel.onchange = ()=>{/* handled in draw loop */};
-
+  // Stop tracks when tab is hidden (prevents iOS camera lockups)
   document.addEventListener('visibilitychange', () => {
-    if(document.hidden){ if(stream) stream.getTracks().forEach(t=>t.stop()); running=false; }
+    if(document.hidden && stream){ stream.getTracks().forEach(t=>t.stop()); running=false; }
   });
+
+  // Initial size
+  resize();
 })();
 </script>
 </body>
