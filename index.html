@@ -75,7 +75,10 @@
 float s2l(float u){return (u<=0.04045)?u/12.92:pow((u+0.055)/1.055,2.4);} float l2s(float u){return (u<=0.0031308)?12.92*u:1.055*pow(u,1.0/2.4)-0.055;}
 vec3 s2l3(vec3 c){return vec3(s2l(c.r),s2l(c.g),s2l(c.b));}
 float filmic(float x){x=clamp(x,0.,1.);float a=.22,b=.3,c=.1,d=.2,e=.01,f=.3;return ((x*(a*x+c*b)+d*e)/(x*(a*x+b)+d*f))-e/f;}
-float h(vec2 p){p=vec2(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3)));return -1.+2.*fract(sin(p)*43758.5453);} 
+float h(vec2 p){
+  // Scalar hash in -1..1. Fix return type (was vec2) causing iOS GLSL compile error.
+  return -1. + 2. * fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+} 
 void main(){
   float t=time; if(stutterSteps>0.){float s=1./stutterSteps; t=floor(time/s)*s;}
   vec2 px=1.0/resolution; // gate weave in pixels
